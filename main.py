@@ -5,16 +5,152 @@ from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume, ISimpleAudioVolume
 from PySide6.QtCore import Qt, QTimer, Signal, Slot, QObject
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QSlider, QPushButton, 
-                             QComboBox, QFrame, QDialog, QMessageBox)
+                             QComboBox, QFrame, QDialog, QMessageBox, QSystemTrayIcon, 
+                             QMenu, QTabWidget, QTextEdit)
+
+class ChannelStrip(QWidget):
+    def __init__(self, channel_idx, parent=None):
+        super().__init__(parent)
+        self.channel_idx = channel_idx
+        self.session_idx = None
+        self.is_muted = False
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        
+        # App selector
+        self.app_selector = QComboBox()
+        self.app_selector.setFixedHeight(30)
+        self.app_selector.setStyleSheet("""
+            QComboBox {
+                background-color: #333;
+                color: white;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #333;
+                color: white;
+                selection-background-color: #555;
+            }
+        """)
+        
+        # Volume label
+        self.volume_label = QLabel("0%")
+        self.volume_label.setAlignment(Qt.AlignCenter)
+        self.volume_label.setStyleSheet("color: white; font-weight: bold;")
+        
+        # Fader
+        self.fader = QSlider(Qt.Vertical)
+        self.fader.setMinimum(0)
+        self.fader.setMaximum(100)
+        self.fader.setValue(0)
+        self.fader.setFixedHeight(200)
+        self.fader.setStyleSheet("""
+            QSlider {
+                background: transparent;
+            }
+            QSlider::groove:vertical {
+                background: #444;
+                width: 30px;
+                border-radius: 4px;
+            }
+            QSlider::handle:vertical {
+                background: #00a8ff;
+                height: 20px;
+                width: 40px;
+                margin: 0 -5px;
+                border-radius: 3px;
+            }
+        """)
+        
+        # Mute button
+        self.mute_btn = QPushButton("M")
+        self.mute_btn.setFixedSize(40, 40)
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #333;
+                color: white;
+                border: 1px solid #555;
+                border-radius: 20px;
+                font-weight: bold;
+            }
+            QPushButton:checked {
+                background-color: #bb0000;
+                color: white;
+            }
+            QPushButton:hover {
+                background-color: #444;
+            }
+        """)
+        
+        # Channel label
+        self.channel_label = QLabel(f"CH {self.channel_idx + 1}")
+        self.channel_label.setAlignment(Qt.AlignCenter)
+        self.channel_label.setStyleSheet("color: #999;")
+        
+        # Add widgets to layout
+        layout.addWidget(self.app_selector)
+        layout.addWidget(self.volume_label)
+        layout.addWidget(self.fader, 1)
+        layout.addWidget(self.mute_btn)
+        layout.addWidget(self.channel_label)
+        
+        # Connect signals
+        self.fader.valueChanged.connect(self.on_fader_value_changed)
+        self.mute_btn.clicked.connect(self.on_mute_clicked)
+        
+    def on_fader_value_changed(self, value):
+        self.volume_label.setText(f"{value}%")
+        
+    def on_mute_clicked(self):
+        self.is_muted = self.mute_btn.isChecked()
+        
+    def set_fader_value(self, value):
+        """Set fader value from MIDI (0.0-1.0)"""
+        value_percent = int(value * 100)
+        self.fader.blockSignals(True)
+        self.fader.setValue(value_percent)
+        self.fader.blockSignals(False)
+        self.volume_label.setText(f"{value_percent}%")
+        
+    def set_app_options(self, apps):
+        """Set available apps in the selector"""
+        self.app_selector.clear()
+        self.app_selector.addItem("Not Assigned", None)
+        for idx, name in apps:
+            self.app_selector.addItem(name, idx)
+            
+    def get_selected_session(self):
+        """Get the selected session index"""
+        return self.app_selector.currentData()
+        
+    def set_mute_state(self, muted):
+        """Set mute button state"""
+        self.is_muted = muted
+        self.mute_btn.blockSignals(True)
+        self.mute_btn.setChecked(muted)
+        self.mute_btn.blockSignals(False)
+
+mido.set_backend('mido.backends.rtmidi')
 
 class MIDIHandler(QObject):
     # Signals
     fader_moved = Signal(int, float)  # channel, value
     button_pressed = Signal(int, bool)  # channel, state (True=pressed)
     knob_turned = Signal(int, float)  # channel, value
+    raw_message_received = Signal(str)  # raw MIDI message
     
     def __init__(self):
         super().__init__()
@@ -28,6 +164,7 @@ class MIDIHandler(QObject):
     def get_available_devices(self):
         """Get lists of available MIDI input and output devices"""
         try:
+            mido.set_backend('mido.backends.rtmidi')  # Ensure the correct backend is set
             input_devices = mido.get_input_names()
             output_devices = mido.get_output_names()
             return input_devices, output_devices
@@ -66,6 +203,8 @@ class MIDIHandler(QObject):
         for msg in self.midi_in.iter_pending():
             if msg.type == 'control_change':
                 self.process_control_change(msg)
+            # Emit raw message for debug tab
+            self.raw_message_received.emit(str(msg))
     
     def process_control_change(self, msg):
         """Process MIDI control change messages"""
@@ -86,13 +225,12 @@ class MIDIHandler(QObject):
         # S buttons (mute) are CC 32-39
         elif 32 <= msg.control <= 39:
             channel = msg.control - 32
-            state = bool(msg.value)
+            state = msg.value >= 64  # Treat values >= 64 as pressed
             
             # Only emit if state changed (handles button press and release properly)
             if self.button_states[channel] != state:
                 self.button_states[channel] = state
-                if state:  # Only emit on press, not release
-                    self.button_pressed.emit(channel, True)
+                self.button_pressed.emit(channel, state)
     
     def send_led_feedback(self, button_idx, state):
         """Send LED feedback to the controller for button states"""
@@ -381,166 +519,67 @@ class DeviceSelectionDialog(QDialog):
         return input_device, output_device
 
 
-class ChannelStrip(QWidget):
-    def __init__(self, channel_idx, parent=None):
-        super().__init__(parent)
-        self.channel_idx = channel_idx
-        self.session_idx = None
-        self.is_muted = False
-        self.setup_ui()
-        
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-        
-        # App selector
-        self.app_selector = QComboBox()
-        self.app_selector.setFixedHeight(30)
-        self.app_selector.setStyleSheet("""
-            QComboBox {
-                background-color: #333;
-                color: white;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 4px;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #333;
-                color: white;
-                selection-background-color: #555;
-            }
-        """)
-        
-        # Volume label
-        self.volume_label = QLabel("0%")
-        self.volume_label.setAlignment(Qt.AlignCenter)
-        self.volume_label.setStyleSheet("color: white; font-weight: bold;")
-        
-        # Fader
-        self.fader = QSlider(Qt.Vertical)
-        self.fader.setMinimum(0)
-        self.fader.setMaximum(100)
-        self.fader.setValue(0)
-        self.fader.setFixedHeight(200)
-        self.fader.setStyleSheet("""
-            QSlider {
-                background: transparent;
-            }
-            QSlider::groove:vertical {
-                background: #444;
-                width: 30px;
-                border-radius: 4px;
-            }
-            QSlider::handle:vertical {
-                background: #00a8ff;
-                height: 20px;
-                width: 40px;
-                margin: 0 -5px;
-                border-radius: 3px;
-            }
-        """)
-        
-        # Mute button
-        self.mute_btn = QPushButton("M")
-        self.mute_btn.setFixedSize(40, 40)
-        self.mute_btn.setCheckable(True)
-        self.mute_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #333;
-                color: white;
-                border: 1px solid #555;
-                border-radius: 20px;
-                font-weight: bold;
-            }
-            QPushButton:checked {
-                background-color: #bb0000;
-                color: white;
-            }
-            QPushButton:hover {
-                background-color: #444;
-            }
-        """)
-        
-        # Channel label
-        self.channel_label = QLabel(f"CH {self.channel_idx + 1}")
-        self.channel_label.setAlignment(Qt.AlignCenter)
-        self.channel_label.setStyleSheet("color: #999;")
-        
-        # Add widgets to layout
-        layout.addWidget(self.app_selector)
-        layout.addWidget(self.volume_label)
-        layout.addWidget(self.fader, 1)
-        layout.addWidget(self.mute_btn)
-        layout.addWidget(self.channel_label)
-        
-        # Connect signals
-        self.fader.valueChanged.connect(self.on_fader_value_changed)
-        self.mute_btn.clicked.connect(self.on_mute_clicked)
-        
-    def on_fader_value_changed(self, value):
-        self.volume_label.setText(f"{value}%")
-        
-    def on_mute_clicked(self):
-        self.is_muted = self.mute_btn.isChecked()
-        
-    def set_fader_value(self, value):
-        """Set fader value from MIDI (0.0-1.0)"""
-        value_percent = int(value * 100)
-        self.fader.blockSignals(True)
-        self.fader.setValue(value_percent)
-        self.fader.blockSignals(False)
-        self.volume_label.setText(f"{value_percent}%")
-        
-    def set_app_options(self, apps):
-        """Set available apps in the selector"""
-        self.app_selector.clear()
-        self.app_selector.addItem("Not Assigned", None)
-        for idx, name in apps:
-            self.app_selector.addItem(name, idx)
-            
-    def get_selected_session(self):
-        """Get the selected session index"""
-        return self.app_selector.currentData()
-        
-    def set_mute_state(self, muted):
-        """Set mute button state"""
-        self.is_muted = muted
-        self.mute_btn.blockSignals(True)
-        self.mute_btn.setChecked(muted)
-        self.mute_btn.blockSignals(False)
-        
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MIDI Mixer Control")
         self.setMinimumSize(800, 500)
-        self.setup_ui()
         
         # Initialize MIDI and Audio handlers
         self.midi_handler = MIDIHandler()
         self.audio_mixer = WindowsAudioMixer()
         
-        # Show device selection dialog
-        self.show_device_selection()
+        # Setup UI after initializing handlers
+        self.setup_ui()
+        
+        # Setup system tray
+        self.setup_tray_icon()
         
         # Connect signals
         self.midi_handler.fader_moved.connect(self.on_midi_fader_moved)
         self.midi_handler.button_pressed.connect(self.on_midi_button_pressed)
+        self.midi_handler.raw_message_received.connect(self.on_raw_message_received)
         
         # Update timer
         self.update_timer = QTimer(self)
         self.update_timer.setInterval(50)  # 50ms interval
         self.update_timer.timeout.connect(self.update_loop)
+        
+        # Show device selection dialog
+        self.show_device_selection()
     
     def setup_ui(self):
         # Main widget and layout
         main_widget = QWidget()
         main_layout = QVBoxLayout(main_widget)
+        
+        # Create tab widget
+        self.tabs = QTabWidget()
+        
+        # Main tab
+        self.main_tab = QWidget()
+        self.setup_main_tab()
+        
+        # Debug tab
+        self.debug_tab = QWidget()
+        self.setup_debug_tab()
+        
+        self.tabs.addTab(self.main_tab, "Main")
+        self.tabs.addTab(self.debug_tab, "Debug")
+        
+        main_layout.addWidget(self.tabs)
+        self.setCentralWidget(main_widget)
+        
+        # Set style
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #1e1e1e;
+                color: white;
+            }
+        """)
+    
+    def setup_main_tab(self):
+        layout = QVBoxLayout(self.main_tab)
         
         # Header area
         header_layout = QHBoxLayout()
@@ -614,23 +653,67 @@ class MainWindow(QMainWindow):
             self.channel_strips.append(strip)
         
         # Add everything to main layout
-        main_layout.addLayout(header_layout)
-        main_layout.addWidget(status_frame)
-        main_layout.addLayout(strips_layout, 1)
+        layout.addLayout(header_layout)
+        layout.addWidget(status_frame)
+        layout.addLayout(strips_layout, 1)
+    
+    def setup_debug_tab(self):
+        layout = QVBoxLayout(self.debug_tab)
         
-        # Set central widget and style
-        self.setCentralWidget(main_widget)
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background-color: #1e1e1e;
-                color: white;
+        self.debug_text = QTextEdit()
+        self.debug_text.setReadOnly(True)
+        self.debug_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #222;
+                color: #0f0;
+                font-family: Consolas, monospace;
             }
         """)
+        
+        layout.addWidget(self.debug_text)
+    
+    def setup_tray_icon(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QIcon("icon.png"))  # Replace with your icon
+        
+        tray_menu = QMenu()
+        show_action = tray_menu.addAction("Show")
+        show_action.triggered.connect(self.show_normal)
+        
+        exit_action = tray_menu.addAction("Exit")
+        exit_action.triggered.connect(self.close)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
+        
+        # Connect tray icon click
+        self.tray_icon.activated.connect(self.tray_icon_clicked)
+    
+    def tray_icon_clicked(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_normal()
+    
+    def show_normal(self):
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
+        self.activateWindow()
+    
+    def closeEvent(self, event):
+        """Handle window close event"""
+        # Minimize to tray instead of closing
+        if self.tray_icon.isVisible():
+            self.hide()
+            event.ignore()
+        else:
+            # Clean up resources
+            self.update_timer.stop()
+            self.midi_handler.close()
+            super().closeEvent(event)
     
     def show_device_selection(self):
         """Show device selection dialog"""
         # Stop the update timer if it's running
-        if self.update_timer.isActive():
+        if hasattr(self, 'update_timer') and self.update_timer.isActive():
             self.update_timer.stop()
         
         # Close existing MIDI connection
@@ -705,16 +788,22 @@ class MainWindow(QMainWindow):
                 # Send LED feedback to controller
                 self.midi_handler.send_led_feedback(channel, new_mute_state)
     
-    def closeEvent(self, event):
-        """Handle window close event"""
-        # Clean up resources
-        self.update_timer.stop()
-        self.midi_handler.close()
-        super().closeEvent(event)
+    def on_raw_message_received(self, message):
+        """Handle raw MIDI messages for debug tab"""
+        self.debug_text.append(message)
+        # Keep only the last 100 lines to prevent memory issues
+        cursor = self.debug_text.textCursor()
+        cursor.movePosition(cursor.Start)
+        cursor.movePosition(cursor.Down, cursor.KeepAnchor, 100)
+        cursor.removeSelectedText()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    # Ensure the application doesn't quit when last window is closed
+    app.setQuitOnLastWindowClosed(False)
+    
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
